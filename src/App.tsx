@@ -40,6 +40,7 @@ import {
 } from "./utils/entitlements";
 import {
   onAuthStateChanged,
+  syncUserProfile,
   AppUser as User,
   subscribeToUserProjects,
   getUserProfileFromSupabase,
@@ -194,12 +195,17 @@ export default function App() {
         setSubscriptionStatus("active");
         setSubscriptionExpiresAt(null);
       } else {
-        const profile = await getUserProfileFromSupabase(currentUser.uid);
-        if (profile) {
-          const effective = getEffectiveTier(profile.subscriptionTier, profile.subscriptionExpiresAt);
-          setSubscriptionTier(effective);
-          setSubscriptionStatus(profile.subscriptionStatus || "active");
-          setSubscriptionExpiresAt(profile.subscriptionExpiresAt || null);
+        try {
+          await syncUserProfile(currentUser);
+          const profile = await getUserProfileFromSupabase(currentUser.uid);
+          if (profile) {
+            const effective = getEffectiveTier(profile.subscriptionTier, profile.subscriptionExpiresAt);
+            setSubscriptionTier(effective);
+            setSubscriptionStatus(profile.subscriptionStatus || "active");
+            setSubscriptionExpiresAt(profile.subscriptionExpiresAt || null);
+          }
+        } catch (error) {
+          console.warn("Profile sync unavailable; continuing with the signed-in user.", error);
         }
       }
     });

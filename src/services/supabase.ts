@@ -98,8 +98,6 @@ export async function syncUserProfile(
         email,
         display_name: name,
         photo_url: photoURL,
-        subscription_tier: "free",
-        subscription_status: "active",
         updated_at: new Date().toISOString(),
       },
       { onConflict: "id" }
@@ -127,7 +125,7 @@ export async function getUserProfileFromSupabase(userId: string): Promise<UserPr
       .from("profiles")
       .select("*")
       .eq("id", userId)
-      .single();
+      .maybeSingle();
 
     if (!error && data) {
       return {
@@ -481,4 +479,3 @@ export function getProjectAssetPublicUrl(path: string): string {
   const { data } = supabase.storage.from("circuit-assets").getPublicUrl(path);
   return data.publicUrl;
 }
-
