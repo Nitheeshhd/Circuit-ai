@@ -512,42 +512,57 @@ export default function App() {
       const reader = res.body?.getReader();
       const decoder = new TextDecoder("utf-8");
       let accumulated = "";
+      let eventBuffer = "";
 
       if (!reader) throw new Error("ReadableStream not supported by browser.");
 
       let receivedError: string | null = null;
+      let receivedDone = false;
+
+      const processEvent = (eventText: string) => {
+        const data = eventText
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (!data) return;
+
+        try {
+          const payload = JSON.parse(data);
+          if (typeof payload.text === "string") {
+            accumulated += payload.text;
+            setStreamedText(accumulated);
+            if (accumulated.length > 250) {
+              setShowLoadingOverlay(false);
+            }
+          }
+          if (payload.error) receivedError = payload.error;
+          if (payload.done === true) receivedDone = true;
+        } catch {
+          console.warn("Ignoring malformed generation stream event.");
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        eventBuffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
 
-        const chunkText = decoder.decode(value, { stream: true });
-        const lines = chunkText.split("\n\n");
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.text) {
-                accumulated += data.text;
-                setStreamedText(accumulated);
-                // Once substantial markdown content arrives, smoothly dismiss overlay to reveal live rendering
-                if (accumulated.length > 250) {
-                  setShowLoadingOverlay(false);
-                }
-              }
-              if (data.error) {
-                receivedError = data.error;
-              }
-            } catch (e) {
-              // Ignore partial JSON parse errors during chunk boundary
-            }
-          }
+        let separator = /\r?\n\r?\n/.exec(eventBuffer);
+        while (separator && separator.index !== undefined) {
+          processEvent(eventBuffer.slice(0, separator.index));
+          eventBuffer = eventBuffer.slice(separator.index + separator[0].length);
+          separator = /\r?\n\r?\n/.exec(eventBuffer);
         }
+
+        if (done) break;
       }
+      if (eventBuffer.trim()) processEvent(eventBuffer);
 
       if (receivedError) {
         throw new Error(receivedError);
+      }
+      if (!receivedDone) {
+        throw new Error("Blueprint generation ended before all sections were received. The sections already generated are preserved; retry to complete the result.");
       }
 
       // Increment monthly project counter on successful generation

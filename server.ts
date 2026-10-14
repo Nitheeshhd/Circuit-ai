@@ -306,17 +306,12 @@ function getGenAIClient(customKey?: string): GoogleGenAI {
   });
 }
 
-function getModelFallbackChain(primaryModel?: string, isThinking?: boolean): string[] {
-  if (primaryModel === "gemini-3.1-flash-lite") {
-    return [primaryModel, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
-  }
-  if (isThinking || primaryModel === "gemini-2.5-pro") {
-    return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
-  }
-  if (primaryModel && ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro", "gemini-1.5-flash"].includes(primaryModel)) {
-    return [primaryModel, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
-  }
-  return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro", "gemini-1.5-flash"];
+function getModelFallbackChain(primaryModel?: string): string[] {
+  const primary = primaryModel || "gemini-3.1-flash-lite";
+  const fallback = primary === "gemini-3.1-flash-lite"
+    ? "gemini-2.5-flash"
+    : "gemini-3.1-flash-lite";
+  return [...new Set([primary, fallback])].slice(0, 2);
 }
 
 // ================= API ENDPOINTS =================
@@ -600,80 +595,128 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
 
     try {
       const ai = getGenAIClient(customKey);
-      const candidateModels = getModelFallbackChain(model_override, thinking_mode);
-
-      let streamSuccess = false;
-      let chunksEmitted = 0;
+      const candidateModels = getModelFallbackChain(model_override);
+      const generationStartedAt = Date.now();
+      const maxGenerationTimeMs = 150_000;
+      const maxAttempts = 2;
+      let attemptsStarted = 0;
+      let completedSectionsSent = 0;
+      let pendingSection = "";
       let lastError: any = null;
+      let generationSucceeded = false;
+
+      const sendEvent = (data: Record<string, unknown>) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      const sendCompletedSections = () => {
+        const headingPattern = /^###\s+[1-8]\.\s+[^\r\n]+/gm;
+        let headings = [...pendingSection.matchAll(headingPattern)];
+        while (headings.length >= 2) {
+          const boundary = headings[1].index;
+          if (boundary === undefined) break;
+          const text = pendingSection.slice(0, boundary);
+          pendingSection = pendingSection.slice(boundary);
+          const section = text.match(/^###\s+([1-8])\./m)?.[1];
+          sendEvent({ text, section, complete: true });
+          completedSectionsSent++;
+          headings = [...pendingSection.matchAll(headingPattern)];
+        }
+      };
 
       for (const modelName of candidateModels) {
-        if (streamSuccess) break;
+        if (
+          generationSucceeded ||
+          attemptsStarted >= maxAttempts ||
+          Date.now() - generationStartedAt >= maxGenerationTimeMs ||
+          completedSectionsSent > 0
+        ) {
+          break;
+        }
 
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            const config: any = {
-              systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
-              temperature: 0.2,
+        attemptsStarted++;
+        const attemptStartedAt = Date.now();
+        const remainingTimeMs = maxGenerationTimeMs - (attemptStartedAt - generationStartedAt);
+        if (remainingTimeMs <= 0) break;
+        pendingSection = "";
+        let attemptText = "";
+        let finishReason: string | undefined;
+
+        try {
+          const config: any = {
+            systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
+            temperature: 0.2,
+            maxOutputTokens: 32_768,
+            abortSignal: AbortSignal.timeout(remainingTimeMs),
+          };
+
+          if (thinking_mode && modelName === "gemini-2.5-pro") {
+            config.thinkingConfig = {
+              thinkingLevel: ThinkingLevel.LOW,
             };
+          }
 
-            if (thinking_mode && modelName === "gemini-2.5-pro") {
-              config.thinkingConfig = {
-                thinkingLevel: ThinkingLevel.HIGH,
-              };
-            }
+          if (enable_search) {
+            config.tools = [{ googleSearch: {} }];
+          }
 
-            if (enable_search) {
-              config.tools = [{ googleSearch: {} }];
-            }
+          const stream = await ai.models.generateContentStream({
+            model: modelName,
+            contents: userPromptText,
+            config,
+          });
 
-            const stream = await ai.models.generateContentStream({
-              model: modelName,
-              contents: userPromptText,
-              config: config,
-            });
-
-            for await (const chunk of stream) {
-              const text = chunk.text;
-              if (text) {
-                res.write(`data: ${JSON.stringify({ text })}\n\n`);
-                chunksEmitted++;
-              }
-            }
-
-            streamSuccess = true;
-            break;
-          } catch (err: any) {
-            lastError = err;
-            safeLog.warn(
-              `Streaming attempt ${attempt + 1} failed on model ${modelName}:`,
-              sanitizeLogOutput(err?.message || String(err))
-            );
-            const parsed = parseGeminiError(err);
-
-            if (chunksEmitted > 0) {
-              streamSuccess = true;
-              break;
-            }
-
-            if (parsed.isOverloaded) {
-              await delay(400 * (attempt + 1));
-              continue;
+          for await (const chunk of stream) {
+            finishReason = chunk.candidates?.[0]?.finishReason || finishReason;
+            const text = chunk.text;
+            if (text) {
+              attemptText += text;
+              pendingSection += text;
+              sendCompletedSections();
             }
           }
+
+          const parsedSectionCount = new Set(
+            [...attemptText.matchAll(/^###\s+([1-8])\.\s+/gm)].map((match) => match[1])
+          ).size;
+          const parseSuccess = parsedSectionCount === 8 && finishReason !== "MAX_TOKENS";
+          console.info(
+            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} parse_success=${parseSuccess}`
+          );
+
+          if (parseSuccess) {
+            if (pendingSection) {
+              const section = pendingSection.match(/^###\s+([1-8])\./m)?.[1];
+              sendEvent({ text: pendingSection, section, complete: true });
+              pendingSection = "";
+              completedSectionsSent++;
+            }
+            generationSucceeded = true;
+          } else {
+            lastError = new Error("The blueprint response was incomplete.");
+          }
+        } catch (error: any) {
+          lastError = error;
+          console.warn(
+            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} parse_success=false error=${sanitizeLogOutput(error?.message || String(error))}`
+          );
         }
       }
 
-      if (streamSuccess) {
-        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      if (generationSucceeded) {
+        sendEvent({ done: true });
         res.end();
       } else {
+        if (pendingSection) {
+          const section = pendingSection.match(/^###\s+([1-8])\./m)?.[1];
+          sendEvent({ text: pendingSection, section, complete: false });
+        }
         const parsed = parseGeminiError(lastError);
-        res.write(
-          `data: ${JSON.stringify({
-            error: parsed.message,
-            code: "GENERATION_FAILED",
-          })}\n\n`
-        );
+        sendEvent({
+          error: "Blueprint generation was incomplete. Earlier sections are preserved; retry to complete the result.",
+          code: "INCOMPLETE_RESULT",
+          detail: parsed.message,
+        });
         res.end();
       }
     } catch (error: any) {
@@ -684,12 +727,10 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
       const parsed = parseGeminiError(error);
       if (res.headersSent) {
         if (!res.writableEnded) {
-          res.write(
-            `data: ${JSON.stringify({
-              error: parsed.message,
-              code: "GENERATION_FAILED",
-            })}\n\n`
-          );
+          res.write(`data: ${JSON.stringify({
+            error: "Blueprint generation was incomplete. Earlier sections are preserved; retry to complete the result.",
+            code: "INCOMPLETE_RESULT",
+          })}\n\n`);
           res.end();
         }
       } else {
