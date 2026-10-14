@@ -1,0 +1,6 @@
+{
+  "name": "Circuito AI",
+  "description": "AI-powered ECE & EEE hardware blueprint, Indian market BOM (₹), pinout matrix, electrical safety guardrails, and firmware generator for engineering students and makers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
