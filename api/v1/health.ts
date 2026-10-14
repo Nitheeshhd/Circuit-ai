@@ -1,5 +1,7 @@
-import app from "../../server";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
-export default function handler(req: any, res: any) {
-  return app(req, res);
+export default function handler(_req: IncomingMessage, res: ServerResponse) {
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify({ status: "ok", time: new Date().toISOString() }));
 }
