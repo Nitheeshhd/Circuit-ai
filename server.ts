@@ -315,15 +315,28 @@ function getModelFallbackChain(primaryModel?: string): string[] {
 }
 
 const EXPECTED_BLUEPRINT_SECTIONS: Record<string, string> = {
-  "1": "Overview",
-  "2": "Bill of Materials",
-  "3": "Pinout and Connections",
-  "4": "Hardware Safety",
-  "5": "Firmware",
-  "6": "Wiring and Testing",
-  "7": "Troubleshooting",
-  "8": "Viva Questions",
+  "1": "Board & Assumptions",
+  "2": "Bill of Materials & Pricing",
+  "3": "Pin-to-Pin Connection Table",
+  "4": "Hardware Safety & Electrical Protection",
+  "5": "Production Firmware Code",
+  "6": "Wiring Notes & Bench Testing Procedure",
+  "7": "Troubleshooting & Failure Recovery",
+  "8": "External Examiner Viva Voce & Technical Defense",
 };
+
+type BlueprintGroup = {
+  id: string;
+  sections: string[];
+  maxOutputTokens: number;
+};
+
+const BLUEPRINT_GROUPS: BlueprintGroup[] = [
+  { id: "overview_bom", sections: ["1", "2"], maxOutputTokens: 6_000 },
+  { id: "connections_safety_testing", sections: ["3", "4", "6"], maxOutputTokens: 6_000 },
+  { id: "firmware", sections: ["5"], maxOutputTokens: 10_000 },
+  { id: "troubleshooting_viva", sections: ["7", "8"], maxOutputTokens: 6_000 },
+];
 
 function getBlueprintSectionHeading(line: string): string | undefined {
   const match = line.match(/^\s{0,3}#{1,6}\s*(?:\d+\s*[.)-]?\s*)?(.+?)\s*#*\s*$/);
@@ -360,6 +373,20 @@ function getBlueprintSectionHeadings(text: string): Array<{ index: number; secti
     }
   }
   return headings;
+}
+
+function splitBlueprintSections(text: string): Record<string, string> {
+  const headings = getBlueprintSectionHeadings(text);
+  const sections: Record<string, string> = {};
+  for (let index = 0; index < headings.length; index++) {
+    const heading = headings[index];
+    const end = headings[index + 1]?.index ?? text.length;
+    const sectionText = text.slice(heading.index, end).trim();
+    if (sectionText && !sections[heading.section]) {
+      sections[heading.section] = sectionText;
+    }
+  }
+  return sections;
 }
 
 // ================= API ENDPOINTS =================
@@ -588,6 +615,7 @@ app.post("/api/v1/generate-stream", createRateLimiter(20, "stream-gen"), async (
       thinking_mode = false,
       enable_search = false,
       model_override,
+      existing_sections = {},
     } = req.body;
 
     // Backend Entitlement Enforcement: Unlimited Prompt Length
@@ -626,166 +654,141 @@ app.post("/api/v1/generate-stream", createRateLimiter(20, "stream-gen"), async (
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
-    const userPromptText = `
-ADVANCED EMBEDDED AGENT GENERATION REQUEST (AutoEmbed + LLM-Embedded + Arduino-LLM-Agent + Arduino-MCP + EmbedEval):
-- Raw Project Description: "${promptCheck.cleanPrompt}"
-- Preferred Microcontroller / Board: ${safeBoard}
-- Firmware Language Target: ${safeLang}
-- Project Complexity / Target: ${safeComplexity}
-
-STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
-1. **Peripheral Dependency & Library Resolution (AutoEmbed)**: Automatically determine necessary libraries, pin mappings, and bus protocols without missing headers or fake methods.
-2. **Physical Execution & Non-Blocking State Machines (LLM-Embedded)**: Implement reliable state machines using millis(), timeout handling, isnan() sensor checks, and robust error recovery.
-3. **Task Decomposition & Pin Allocation (Arduino-LLM-Agent & Arduino-MCP)**: Enforce micro-controller constraints (avoiding ESP32 strapping/ADC2 conflicts, respecting Uno 5V / Pico 3.3V logic boundaries).
-4. **Multi-Role Safety & Evaluation (EmbedEval)**: Ensure proper power rails, common GND, flyback protection for inductive loads, and level shifting.
-5. **Output Format**: Ensure all 8 sections are fully detailed with pure GFM tables and 100% compilable firmware code.
-  `;
-
     try {
       const ai = getGenAIClient(customKey);
       const candidateModels = getModelFallbackChain(model_override);
       const generationStartedAt = Date.now();
-      const maxGenerationTimeMs = 150_000;
-      const maxAttempts = 2;
-      let attemptsStarted = 0;
-      let pendingSection = "";
-      let lastError: any = null;
-      let generationSucceeded = false;
-      let finishReason: string | undefined;
-      let tokenLimitReached = false;
-      let sectionsSent = 0;
-      let lastAttemptText = "";
+      const maxGenerationTimeMs = 270_000;
+      const perCallTimeoutMs = 90_000;
+      const normalizedExistingSections: Record<string, string> = {};
+      if (existing_sections && typeof existing_sections === "object" && !Array.isArray(existing_sections)) {
+        for (const section of Object.keys(EXPECTED_BLUEPRINT_SECTIONS)) {
+          const text = (existing_sections as Record<string, unknown>)[section];
+          if (typeof text === "string" && text.trim()) {
+            normalizedExistingSections[section] = text.trim();
+          }
+        }
+      }
 
       const sendEvent = (data: Record<string, unknown>) => {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
-      const sendCompletedSections = () => {
-        const headings = getBlueprintSectionHeadings(pendingSection);
-        if (headings.length < 2) return;
+      const validExistingSections = normalizedExistingSections;
+      const groupsToGenerate = BLUEPRINT_GROUPS.map((group) => ({
+        ...group,
+        sections: group.sections.filter((section) => !validExistingSections[section]),
+      })).filter((group) => group.sections.length > 0);
+      const failedSections = new Set<string>();
 
-        let previousOffset = 0;
-        for (let index = 1; index < headings.length; index++) {
-          const heading = headings[index];
-          const text = pendingSection.slice(previousOffset, heading.index);
-          sendEvent({ text, section: headings[index - 1].section, complete: true });
-          sectionsSent++;
-          previousOffset = heading.index;
-        }
-        pendingSection = pendingSection.slice(previousOffset);
-      };
+      const generateGroup = async (group: BlueprintGroup) => {
+        const headings = group.sections
+          .map((section) => `### ${section}. ${EXPECTED_BLUEPRINT_SECTIONS[section]}`)
+          .join("\n");
+        const projectContext = `Project: ${promptCheck.cleanPrompt}\nBoard: ${safeBoard}\nLanguage: ${safeLang}\nComplexity: ${safeComplexity}`;
+        const groupInstructions = `Generate concise, technically accurate Markdown for only these sections, using each exact heading verbatim and in this order:\n${headings}\nDo not add other sections or introductory text. Keep prose brief. Use tables only where they are helpful. Apply safe pin, voltage, current, and power guidance. For firmware, return only a concise, well-commented compilable code block under its heading.`;
+        const models = [...candidateModels];
+        let lastError: any;
 
-      for (const modelName of candidateModels) {
-        if (
-          generationSucceeded ||
-          attemptsStarted >= maxAttempts ||
-          Date.now() - generationStartedAt >= maxGenerationTimeMs ||
-          sectionsSent > 0
-        ) {
-          break;
-        }
+        for (const modelName of models) {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            const elapsed = Date.now() - generationStartedAt;
+            const remaining = maxGenerationTimeMs - elapsed;
+            if (remaining <= 1_000) {
+              lastError = new Error("Generation time budget exhausted.");
+              break;
+            }
 
-        attemptsStarted++;
-        const attemptStartedAt = Date.now();
-        const remainingTimeMs = maxGenerationTimeMs - (attemptStartedAt - generationStartedAt);
-        if (remainingTimeMs <= 0) break;
-        pendingSection = "";
-        let attemptText = "";
-        lastAttemptText = "";
-        finishReason = undefined;
+            const attemptStartedAt = Date.now();
+            const controller = new AbortController();
+            const timeout = Math.min(perCallTimeoutMs, remaining - 1_000);
+            const abortTimer = setTimeout(() => controller.abort(), timeout);
+            let finishReason = "UNKNOWN";
 
-        try {
-          const config: any = {
-            systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
-            temperature: 0.2,
-            maxOutputTokens: 65_536,
-            abortSignal: AbortSignal.timeout(remainingTimeMs),
-          };
+            try {
+              const config: any = {
+                systemInstruction: "You are a concise senior embedded-systems engineer. Give accurate, safe, buildable hardware and firmware guidance. Follow the user's exact Markdown section headings.",
+                temperature: 0.2,
+                maxOutputTokens: group.maxOutputTokens,
+                abortSignal: controller.signal,
+                thinkingConfig: modelName.startsWith("gemini-2.5")
+                  ? { thinkingBudget: thinking_mode ? 1_024 : 0 }
+                  : { thinkingLevel: thinking_mode ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL },
+              };
+              if (enable_search) config.tools = [{ googleSearch: {} }];
 
-          if (thinking_mode && modelName === "gemini-2.5-pro") {
-            config.thinkingConfig = {
-              thinkingLevel: ThinkingLevel.LOW,
-            };
-          }
+              const response = await ai.models.generateContent({
+                model: modelName,
+                contents: `${projectContext}\n\n${groupInstructions}`,
+                config,
+              });
+              const sections = splitBlueprintSections(response.text || "");
+              finishReason = response.candidates?.[0]?.finishReason || "UNKNOWN";
+              const usableSections = group.sections.filter((section) => sections[section]);
+              const foundSections = finishReason === "MAX_TOKENS"
+                ? usableSections.slice(0, -1)
+                : usableSections;
+              const absentSections = group.sections.filter((section) =>
+                !sections[section] || (finishReason === "MAX_TOKENS" && section === usableSections.at(-1))
+              );
+              console.info(
+                `[Blueprint] group=${group.id} model=${modelName} attempt=${attempt} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason} status=success sections_found=${JSON.stringify(foundSections.map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))}`
+              );
 
-          if (enable_search) {
-            config.tools = [{ googleSearch: {} }];
-          }
+              for (const section of foundSections) {
+                sendEvent({ section, text: sections[section], complete: true });
+              }
+              for (const section of absentSections) failedSections.add(section);
+              if (absentSections.length > 0) {
+                console.warn(`[Blueprint] group=${group.id} missing_sections=${JSON.stringify(absentSections.map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))}`);
+              }
+              return;
+            } catch (error: any) {
+              lastError = error;
+              const status = Number(error?.status || error?.statusCode) || "unknown";
+              const code = String(error?.code || error?.status || "UNKNOWN");
+              const transient = status === 429 || status === 503 ||
+                /UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|temporar/i.test(`${code} ${error?.message || ""}`);
+              console.warn(
+                `[Blueprint] group=${group.id} model=${modelName} attempt=${attempt} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason} status=${status} error_code=${code} sections_found=[]`
+              );
 
-          const stream = await ai.models.generateContentStream({
-            model: modelName,
-            contents: userPromptText,
-            config,
-          });
-
-          for await (const chunk of stream) {
-            finishReason = chunk.candidates?.[0]?.finishReason || finishReason;
-            const text = chunk.text;
-            if (text) {
-              attemptText += text;
-              lastAttemptText += text;
-              pendingSection += text;
-              sendCompletedSections();
+              if (!transient) break;
+              if (attempt < 3) {
+                const backoff = attempt === 1 ? 2_000 : 5_000;
+                const jitter = Math.floor(Math.random() * 500);
+                const remainingAfterCall = maxGenerationTimeMs - (Date.now() - generationStartedAt);
+                if (remainingAfterCall <= backoff + perCallTimeoutMs + 1_000) break;
+                await delay(backoff + jitter);
+              }
+            } finally {
+              clearTimeout(abortTimer);
             }
           }
+        }
 
-          const foundSections = getFoundBlueprintSections(attemptText);
-          const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
-            .filter((section) => !foundSections.has(section))
-            .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
-          console.info(
-            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason || "UNKNOWN"} parse_success=${finishReason !== "MAX_TOKENS"} found_sections=${JSON.stringify([...foundSections].map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))} missing_sections=${JSON.stringify(missingSections)}`
-          );
+        for (const section of group.sections) failedSections.add(section);
+        console.error(
+          `[Blueprint] group=${group.id} failed status=${lastError?.status || "unknown"} error_code=${lastError?.code || "UNKNOWN"}`
+        );
+      };
 
-          if (pendingSection) {
-            const section = getBlueprintSectionHeadings(pendingSection)[0]?.section;
-            sendEvent({ text: pendingSection, section, complete: true });
-            sectionsSent++;
-            pendingSection = "";
-          }
-          tokenLimitReached = finishReason === "MAX_TOKENS";
-          generationSucceeded = true;
-        } catch (error: any) {
-          lastError = error;
-          const foundSections = getFoundBlueprintSections(attemptText);
-          const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
-            .filter((section) => !foundSections.has(section))
-            .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
-          console.warn(
-            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason || "UNKNOWN"} parse_success=false found_sections=${JSON.stringify([...foundSections].map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))} missing_sections=${JSON.stringify(missingSections)} error=${sanitizeLogOutput(error?.message || String(error))}`
-          );
+      const settled = await Promise.allSettled(groupsToGenerate.map((group) => generateGroup(group)));
+      for (const result of settled) {
+        if (result.status === "rejected") {
+          console.error("[Blueprint] unexpected group failure:", sanitizeLogOutput(String(result.reason)));
         }
       }
 
-      if (generationSucceeded) {
-        const foundSections = getFoundBlueprintSections(lastAttemptText);
-        const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
-          .filter((section) => !foundSections.has(section))
-          .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
-        if (missingSections.length > 0 || tokenLimitReached) {
-          sendEvent({
-            warning: tokenLimitReached
-              ? `Generation reached the ${65_536}-token output limit. The sections returned are available; some content may be truncated.`
-              : `Generation completed, but these sections were not detected: ${missingSections.join(", ")}.`,
-            missingSections,
-            tokenLimitReached,
-          });
-        }
-        sendEvent({ done: true });
-        res.end();
-      } else {
-        if (pendingSection) {
-          const section = getBlueprintSectionHeadings(pendingSection)[0]?.section;
-          sendEvent({ text: pendingSection, section, complete: false });
-        }
-        const parsed = parseGeminiError(lastError);
-        sendEvent({
-          error: "Blueprint generation was incomplete. Earlier sections are preserved; retry to complete the result.",
-          code: "INCOMPLETE_RESULT",
-          detail: parsed.message,
-        });
-        res.end();
-      }
+      const failed = [...failedSections].sort((a, b) => Number(a) - Number(b));
+      sendEvent({
+        failed_sections: failed,
+        warning: failed.length
+          ? `Some sections could not be generated: ${failed.map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]).join(", ")}. Retry to generate only those sections.`
+          : undefined,
+      });
+      sendEvent({ done: true });
+      res.end();
     } catch (error: any) {
       safeLog.error(
         "Stream generation outer error:",

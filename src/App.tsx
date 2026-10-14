@@ -32,7 +32,7 @@ import {
   SubscriptionTier,
   SubscriptionStatus,
 } from "./types";
-import { parseBlueprintMarkdown } from "./utils/parser";
+import { assembleBlueprintSections, parseBlueprintMarkdown } from "./utils/parser";
 import {
   hasRemainingMonthlyQuota,
   incrementMonthlyUsage,
@@ -84,6 +84,7 @@ export default function App() {
   const [streamedText, setStreamedText] = useState<string>("");
   const [blueprint, setBlueprint] = useState<ParsedBlueprint>(() => parseBlueprintMarkdown(""));
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const generatedSectionsRef = useRef<Record<string, string>>({});
 
   // Supabase Auth & Cloud Projects
   const [user, setUser] = useState<User | null>(null);
@@ -441,7 +442,7 @@ export default function App() {
   };
 
   // Generate Stream
-  const handleGenerate = async (requestedModel?: string) => {
+  const handleGenerate = async (requestedModel?: string, retryMissingSections = false) => {
     if (!prompt.trim()) return;
 
     // Verify monthly generation quota (9 free projects per month per account)
@@ -463,8 +464,11 @@ export default function App() {
     setIsGenerating(true);
     setShowLoadingOverlay(true);
     setErrorMsg(null);
-    setStreamedText("");
-    setBlueprint(parseBlueprintMarkdown(""));
+    if (!retryMissingSections) {
+      generatedSectionsRef.current = {};
+      setStreamedText("");
+      setBlueprint(parseBlueprintMarkdown(""));
+    }
 
     abortControllerRef.current = new AbortController();
 
@@ -492,6 +496,7 @@ export default function App() {
           thinking_mode: thinkingMode,
           enable_search: searchGrounding,
           model_override: modelOverride,
+          existing_sections: retryMissingSections ? generatedSectionsRef.current : {},
         }),
         signal: abortControllerRef.current.signal,
       });
@@ -519,6 +524,7 @@ export default function App() {
       let receivedError: string | null = null;
       let receivedWarning: string | null = null;
       let receivedDone = false;
+      let failedSections: string[] = [];
 
       const processEvent = (eventText: string) => {
         const data = eventText
@@ -531,7 +537,12 @@ export default function App() {
         try {
           const payload = JSON.parse(data);
           if (typeof payload.text === "string") {
-            accumulated += payload.text;
+            if (typeof payload.section === "string") {
+              generatedSectionsRef.current[payload.section] = payload.text;
+              accumulated = assembleBlueprintSections(generatedSectionsRef.current);
+            } else {
+              accumulated += payload.text;
+            }
             setStreamedText(accumulated);
             if (accumulated.length > 250) {
               setShowLoadingOverlay(false);
@@ -539,6 +550,11 @@ export default function App() {
           }
           if (payload.error) receivedError = payload.error;
           if (payload.warning) receivedWarning = payload.warning;
+          if (Array.isArray(payload.failed_sections)) {
+            failedSections = payload.failed_sections.filter((section: unknown): section is string =>
+              typeof section === "string"
+            );
+          }
           if (payload.done === true) receivedDone = true;
         } catch {
           console.warn("Ignoring malformed generation stream event.");
@@ -566,12 +582,12 @@ export default function App() {
       if (!receivedDone) {
         throw new Error("Blueprint generation ended before all sections were received. The sections already generated are preserved; retry to complete the result.");
       }
-      if (receivedWarning) {
-        setErrorMsg(receivedWarning);
+      if (receivedWarning || failedSections.length > 0) {
+        setErrorMsg(receivedWarning || "Some sections are still missing. Retry to generate only those sections.");
       }
 
       // Increment monthly project counter on successful generation
-      if (accumulated.trim().length > 100) {
+      if (failedSections.length === 0 && accumulated.trim().length > 100) {
         incrementMonthlyUsage(userId);
         try {
           confetti({
@@ -783,7 +799,7 @@ export default function App() {
                     <p className="text-rose-200/90 leading-relaxed font-sans">{errorMsg}</p>
                     <div className="pt-1 flex flex-wrap items-center gap-3 font-tech">
                       <button
-                        onClick={() => handleGenerate()}
+                        onClick={() => handleGenerate(undefined, true)}
                         className="px-3 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 rounded-lg text-xs font-bold border border-rose-500/30 transition cursor-pointer"
                       >
                         ↻ Retry Blueprint
@@ -794,7 +810,7 @@ export default function App() {
                           setThinkingMode(false);
                           setModelMode("lite");
                           setErrorMsg(null);
-                          void handleGenerate("gemini-3.1-flash-lite");
+                          void handleGenerate("gemini-3.1-flash-lite", true);
                         }}
                         className="px-3 py-1 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 rounded-lg text-xs font-bold border border-indigo-500/30 transition cursor-pointer"
                       >

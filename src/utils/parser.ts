@@ -1,6 +1,15 @@
 import { BOMItem, PinoutRow, SafetyNotice, VivaQuestion, ParsedBlueprint } from "../types";
 import { calculateBOMCostSummary, matchMarketItem } from "../data/marketPrices";
 
+const CANONICAL_BLUEPRINT_SECTION_ORDER = ["1", "2", "3", "4", "5", "6", "7", "8"];
+
+export function assembleBlueprintSections(sections: Record<string, string>): string {
+  return CANONICAL_BLUEPRINT_SECTION_ORDER
+    .map((section) => sections[section]?.trim())
+    .filter((section): section is string => Boolean(section))
+    .join("\n\n");
+}
+
 export function parseBlueprintMarkdown(markdown: string): ParsedBlueprint {
   const result: ParsedBlueprint = {
     rawMarkdown: markdown,
