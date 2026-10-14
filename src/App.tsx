@@ -517,6 +517,7 @@ export default function App() {
       if (!reader) throw new Error("ReadableStream not supported by browser.");
 
       let receivedError: string | null = null;
+      let receivedWarning: string | null = null;
       let receivedDone = false;
 
       const processEvent = (eventText: string) => {
@@ -537,6 +538,7 @@ export default function App() {
             }
           }
           if (payload.error) receivedError = payload.error;
+          if (payload.warning) receivedWarning = payload.warning;
           if (payload.done === true) receivedDone = true;
         } catch {
           console.warn("Ignoring malformed generation stream event.");
@@ -563,6 +565,9 @@ export default function App() {
       }
       if (!receivedDone) {
         throw new Error("Blueprint generation ended before all sections were received. The sections already generated are preserved; retry to complete the result.");
+      }
+      if (receivedWarning) {
+        setErrorMsg(receivedWarning);
       }
 
       // Increment monthly project counter on successful generation

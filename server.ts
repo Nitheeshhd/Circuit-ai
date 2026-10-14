@@ -314,6 +314,54 @@ function getModelFallbackChain(primaryModel?: string): string[] {
   return [...new Set([primary, fallback])].slice(0, 2);
 }
 
+const EXPECTED_BLUEPRINT_SECTIONS: Record<string, string> = {
+  "1": "Overview",
+  "2": "Bill of Materials",
+  "3": "Pinout and Connections",
+  "4": "Hardware Safety",
+  "5": "Firmware",
+  "6": "Wiring and Testing",
+  "7": "Troubleshooting",
+  "8": "Viva Questions",
+};
+
+function getBlueprintSectionHeading(line: string): string | undefined {
+  const match = line.match(/^\s{0,3}#{1,6}\s*(?:\d+\s*[.)-]?\s*)?(.+?)\s*#*\s*$/);
+  if (!match) return undefined;
+
+  const title = match[1].toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (/board assumptions|executive summary|overview|project summary|system summary/.test(title)) return "1";
+  if (/bill of materials|\bbom\b|components|parts list|component list/.test(title)) return "2";
+  if (/pin to pin|pinout|connection table|connections|wiring diagram/.test(title)) return "3";
+  if (/hardware safety|electrical protection|safety/.test(title)) return "4";
+  if (/production firmware|firmware code|\bfirmware\b/.test(title)) return "5";
+  if (/wiring notes|bench testing|testing procedure|bench test|verification procedure/.test(title)) return "6";
+  if (/troubleshooting|failure recovery/.test(title)) return "7";
+  if (/viva|technical defense|examiner|interview questions|question and answer|q and a/.test(title)) return "8";
+  return undefined;
+}
+
+function getFoundBlueprintSections(text: string): Set<string> {
+  const found = new Set<string>();
+  for (const heading of getBlueprintSectionHeadings(text)) {
+    const section = heading.section;
+    if (section) found.add(section);
+  }
+  return found;
+}
+
+function getBlueprintSectionHeadings(text: string): Array<{ index: number; section: string }> {
+  const headings: Array<{ index: number; section: string }> = [];
+  const pattern = /^\s{0,3}#{1,6}\s*(?:\d+\s*[.)-]?\s*)?(.+?)\s*#*\s*$/gm;
+  for (const match of text.matchAll(pattern)) {
+    const section = getBlueprintSectionHeading(match[0]);
+    if (section && match.index !== undefined) {
+      headings.push({ index: match.index, section });
+    }
+  }
+  return headings;
+}
+
 // ================= API ENDPOINTS =================
 
 // 0. API Gateway Root & Status
@@ -600,28 +648,31 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
       const maxGenerationTimeMs = 150_000;
       const maxAttempts = 2;
       let attemptsStarted = 0;
-      let completedSectionsSent = 0;
       let pendingSection = "";
       let lastError: any = null;
       let generationSucceeded = false;
+      let finishReason: string | undefined;
+      let tokenLimitReached = false;
+      let sectionsSent = 0;
+      let lastAttemptText = "";
 
       const sendEvent = (data: Record<string, unknown>) => {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
       const sendCompletedSections = () => {
-        const headingPattern = /^###\s+[1-8]\.\s+[^\r\n]+/gm;
-        let headings = [...pendingSection.matchAll(headingPattern)];
-        while (headings.length >= 2) {
-          const boundary = headings[1].index;
-          if (boundary === undefined) break;
-          const text = pendingSection.slice(0, boundary);
-          pendingSection = pendingSection.slice(boundary);
-          const section = text.match(/^###\s+([1-8])\./m)?.[1];
-          sendEvent({ text, section, complete: true });
-          completedSectionsSent++;
-          headings = [...pendingSection.matchAll(headingPattern)];
+        const headings = getBlueprintSectionHeadings(pendingSection);
+        if (headings.length < 2) return;
+
+        let previousOffset = 0;
+        for (let index = 1; index < headings.length; index++) {
+          const heading = headings[index];
+          const text = pendingSection.slice(previousOffset, heading.index);
+          sendEvent({ text, section: headings[index - 1].section, complete: true });
+          sectionsSent++;
+          previousOffset = heading.index;
         }
+        pendingSection = pendingSection.slice(previousOffset);
       };
 
       for (const modelName of candidateModels) {
@@ -629,7 +680,7 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
           generationSucceeded ||
           attemptsStarted >= maxAttempts ||
           Date.now() - generationStartedAt >= maxGenerationTimeMs ||
-          completedSectionsSent > 0
+          sectionsSent > 0
         ) {
           break;
         }
@@ -640,13 +691,14 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
         if (remainingTimeMs <= 0) break;
         pendingSection = "";
         let attemptText = "";
-        let finishReason: string | undefined;
+        lastAttemptText = "";
+        finishReason = undefined;
 
         try {
           const config: any = {
             systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
             temperature: 0.2,
-            maxOutputTokens: 32_768,
+            maxOutputTokens: 65_536,
             abortSignal: AbortSignal.timeout(remainingTimeMs),
           };
 
@@ -671,44 +723,59 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
             const text = chunk.text;
             if (text) {
               attemptText += text;
+              lastAttemptText += text;
               pendingSection += text;
               sendCompletedSections();
             }
           }
 
-          const parsedSectionCount = new Set(
-            [...attemptText.matchAll(/^###\s+([1-8])\.\s+/gm)].map((match) => match[1])
-          ).size;
-          const parseSuccess = parsedSectionCount === 8 && finishReason !== "MAX_TOKENS";
+          const foundSections = getFoundBlueprintSections(attemptText);
+          const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
+            .filter((section) => !foundSections.has(section))
+            .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
           console.info(
-            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} parse_success=${parseSuccess}`
+            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason || "UNKNOWN"} parse_success=${finishReason !== "MAX_TOKENS"} found_sections=${JSON.stringify([...foundSections].map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))} missing_sections=${JSON.stringify(missingSections)}`
           );
 
-          if (parseSuccess) {
-            if (pendingSection) {
-              const section = pendingSection.match(/^###\s+([1-8])\./m)?.[1];
-              sendEvent({ text: pendingSection, section, complete: true });
-              pendingSection = "";
-              completedSectionsSent++;
-            }
-            generationSucceeded = true;
-          } else {
-            lastError = new Error("The blueprint response was incomplete.");
+          if (pendingSection) {
+            const section = getBlueprintSectionHeadings(pendingSection)[0]?.section;
+            sendEvent({ text: pendingSection, section, complete: true });
+            sectionsSent++;
+            pendingSection = "";
           }
+          tokenLimitReached = finishReason === "MAX_TOKENS";
+          generationSucceeded = true;
         } catch (error: any) {
           lastError = error;
+          const foundSections = getFoundBlueprintSections(attemptText);
+          const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
+            .filter((section) => !foundSections.has(section))
+            .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
           console.warn(
-            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} parse_success=false error=${sanitizeLogOutput(error?.message || String(error))}`
+            `[Blueprint] model=${modelName} attempt=${attemptsStarted} elapsed_ms=${Date.now() - attemptStartedAt} finish_reason=${finishReason || "UNKNOWN"} parse_success=false found_sections=${JSON.stringify([...foundSections].map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]))} missing_sections=${JSON.stringify(missingSections)} error=${sanitizeLogOutput(error?.message || String(error))}`
           );
         }
       }
 
       if (generationSucceeded) {
+        const foundSections = getFoundBlueprintSections(lastAttemptText);
+        const missingSections = Object.keys(EXPECTED_BLUEPRINT_SECTIONS)
+          .filter((section) => !foundSections.has(section))
+          .map((section) => EXPECTED_BLUEPRINT_SECTIONS[section]);
+        if (missingSections.length > 0 || tokenLimitReached) {
+          sendEvent({
+            warning: tokenLimitReached
+              ? `Generation reached the ${65_536}-token output limit. The sections returned are available; some content may be truncated.`
+              : `Generation completed, but these sections were not detected: ${missingSections.join(", ")}.`,
+            missingSections,
+            tokenLimitReached,
+          });
+        }
         sendEvent({ done: true });
         res.end();
       } else {
         if (pendingSection) {
-          const section = pendingSection.match(/^###\s+([1-8])\./m)?.[1];
+          const section = getBlueprintSectionHeadings(pendingSection)[0]?.section;
           sendEvent({ text: pendingSection, section, complete: false });
         }
         const parsed = parseGeminiError(lastError);
