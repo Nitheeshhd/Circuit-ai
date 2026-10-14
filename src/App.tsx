@@ -183,10 +183,15 @@ export default function App() {
   const [showLoadingOverlay, setShowLoadingOverlay] = useState<boolean>(false);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const syncedProfileUserIdsRef = useRef(new Set<string>());
 
   // Listen to Supabase Auth state & sync subscription profile
   useEffect(() => {
-    const unsubscribeAuth = onAuthStateChanged(async (currentUser) => {
+    let isActive = true;
+    let activeUserId: string | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged((currentUser, event) => {
+      activeUserId = currentUser?.uid || null;
       setUser(currentUser);
       setIsLoadingAuth(false);
       if (!currentUser) {
@@ -194,22 +199,36 @@ export default function App() {
         setSubscriptionTier("free");
         setSubscriptionStatus("active");
         setSubscriptionExpiresAt(null);
-      } else {
-        try {
-          await syncUserProfile(currentUser);
-          const profile = await getUserProfileFromSupabase(currentUser.uid);
-          if (profile) {
-            const effective = getEffectiveTier(profile.subscriptionTier, profile.subscriptionExpiresAt);
-            setSubscriptionTier(effective);
-            setSubscriptionStatus(profile.subscriptionStatus || "active");
-            setSubscriptionExpiresAt(profile.subscriptionExpiresAt || null);
-          }
-        } catch (error) {
-          console.warn("Profile sync unavailable; continuing with the signed-in user.", error);
-        }
+        return;
       }
+
+      if (
+        (event !== "SIGNED_IN" && event !== "INITIAL_SESSION") ||
+        syncedProfileUserIdsRef.current.has(currentUser.uid)
+      ) {
+        return;
+      }
+
+      syncedProfileUserIdsRef.current.add(currentUser.uid);
+      void (async () => {
+        const synced = await syncUserProfile(currentUser);
+        if (!synced) return;
+
+        const profile = await getUserProfileFromSupabase(currentUser.uid);
+        if (!isActive || activeUserId !== currentUser.uid || !profile) return;
+
+        const effective = getEffectiveTier(profile.subscriptionTier, profile.subscriptionExpiresAt);
+        setSubscriptionTier(effective);
+        setSubscriptionStatus(profile.subscriptionStatus || "active");
+        setSubscriptionExpiresAt(profile.subscriptionExpiresAt || null);
+      })().catch((error) => {
+        console.warn("Profile sync unavailable; continuing with the signed-in user.", error);
+      });
     });
-    return () => unsubscribeAuth();
+    return () => {
+      isActive = false;
+      unsubscribeAuth();
+    };
   }, []);
 
   // Handle successful subscription activation

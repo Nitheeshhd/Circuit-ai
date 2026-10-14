@@ -51,21 +51,21 @@ export function mapSupabaseUser(user: SupabaseUser): AppUser {
   };
 }
 
-let lastDispatchedUserId: string | null | undefined = undefined;
+type AppAuthEvent = "INITIAL_SESSION" | "SIGNED_IN" | "SIGNED_OUT";
 
-export function onAuthStateChanged(callback: (user: AppUser | null) => void) {
+export function onAuthStateChanged(
+  callback: (user: AppUser | null, event: AppAuthEvent) => void
+) {
   // onAuthStateChange fires immediately on subscription with INITIAL_SESSION
   const {
     data: { subscription },
   } = supabase.auth.onAuthStateChange((event, session) => {
-    const user = session?.user ? mapSupabaseUser(session.user) : null;
-    const currentId = user?.uid || null;
-
-    // Deduplicate identical sequential auth notifications to prevent duplicate DB calls
-    if (lastDispatchedUserId !== currentId || event === "USER_UPDATED") {
-      lastDispatchedUserId = currentId;
-      callback(user);
+    if (event !== "INITIAL_SESSION" && event !== "SIGNED_IN" && event !== "SIGNED_OUT") {
+      return;
     }
+
+    const user = session?.user ? mapSupabaseUser(session.user) : null;
+    callback(user, event);
   });
 
   return () => {
@@ -76,7 +76,7 @@ export function onAuthStateChanged(callback: (user: AppUser | null) => void) {
 export async function syncUserProfile(
   user: SupabaseUser | AppUser,
   customDisplayName?: string
-): Promise<void> {
+): Promise<boolean> {
   try {
     const userId = "uid" in user ? user.uid : user.id;
     const name =
@@ -104,18 +104,14 @@ export async function syncUserProfile(
     );
 
     if (error) {
-      // Graceful fallback: sync into Supabase auth user_metadata so profile is never lost
-      try {
-        await supabase.auth.updateUser({
-          data: {
-            display_name: name,
-            avatar_url: photoURL,
-          },
-        });
-      } catch {}
+      console.warn("User profile sync unavailable; continuing without a profile row.", error);
+      return false;
     }
+
+    return true;
   } catch (err) {
-    console.warn("User profile sync fallback active:", err);
+    console.warn("User profile sync unavailable; continuing without a profile row.", err);
+    return false;
   }
 }
 
@@ -239,9 +235,7 @@ export async function signInWithEmail(email: string, pass: string, _rememberMe?:
   if (error) throw error;
   if (!data.user) throw new Error("No user returned from Supabase sign in");
 
-  const mappedUser = mapSupabaseUser(data.user);
-  await syncUserProfile(mappedUser);
-  return mappedUser;
+  return mapSupabaseUser(data.user);
 }
 
 export async function signUpWithEmail(
@@ -265,7 +259,6 @@ export async function signUpWithEmail(
 
   const mappedUser = mapSupabaseUser(data.user);
   if (displayName) mappedUser.displayName = displayName;
-  await syncUserProfile(mappedUser, displayName);
   return mappedUser;
 }
 
@@ -283,7 +276,6 @@ export async function signInAsGuest(): Promise<AppUser> {
 
   const mappedUser = mapSupabaseUser(data.user);
   mappedUser.displayName = "Guest Engineer";
-  await syncUserProfile(mappedUser, "Guest Engineer");
   return mappedUser;
 }
 
