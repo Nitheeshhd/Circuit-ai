@@ -1,4 +1,4 @@
-import app from "../../server";
+import app from "../../server.js";
 
 function safeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);

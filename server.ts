@@ -21,7 +21,13 @@ export const APP_URL =
 app.disable("x-powered-by");
 
 // Secure JSON payload limit to prevent DoS memory exhaustion
-app.use(express.json({ limit: "1mb" }));
+const jsonParser = express.json({ limit: "1mb" });
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.body !== undefined || req.readableEnded) {
+    return next();
+  }
+  return jsonParser(req, res, next);
+});
 
 // Normalize request URLs and handle CORS for Vercel serverless functions and local dev
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -638,7 +644,10 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
             break;
           } catch (err: any) {
             lastError = err;
-            safeLog.warn(`Streaming attempt ${attempt + 1} failed on model ${modelName}:`, err?.message || err);
+            safeLog.warn(
+              `Streaming attempt ${attempt + 1} failed on model ${modelName}:`,
+              sanitizeLogOutput(err?.message || String(err))
+            );
             const parsed = parseGeminiError(err);
 
             if (chunksEmitted > 0) {
@@ -668,7 +677,10 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
         res.end();
       }
     } catch (error: any) {
-      safeLog.error("Stream generation outer error:", error);
+      safeLog.error(
+        "Stream generation outer error:",
+        sanitizeLogOutput(error instanceof Error ? error.message : String(error))
+      );
       const parsed = parseGeminiError(error);
       if (res.headersSent) {
         if (!res.writableEnded) {
@@ -690,7 +702,10 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
       cleanupConnection();
     }
   } catch (error: any) {
-    safeLog.error("Generation request setup error:", error?.message || error);
+    safeLog.error(
+      "Generation request setup error:",
+      sanitizeLogOutput(error?.message || String(error))
+    );
     const parsed = parseGeminiError(error);
     const statusCode =
       parsed.statusCode >= 400 && parsed.statusCode < 600 ? parsed.statusCode : 500;
@@ -1095,7 +1110,11 @@ app.use("/api/*", (_req: Request, res: Response) => {
 
 // Global Express Error Handler for unhandled middleware/route exceptions
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  safeLog.error("Global Express Error Handler caught an exception:", err);
+  const errorMessage = err instanceof Error ? err.message : String(err);
+  console.error(
+    "Global Express error handler caught an exception:",
+    sanitizeLogOutput(errorMessage)
+  );
   if (!res.headersSent) {
     const statusCode = Number(err?.status || err?.statusCode) || 500;
     const isMalformedJson = err?.type === "entity.parse.failed";
