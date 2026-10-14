@@ -301,6 +301,9 @@ function getGenAIClient(customKey?: string): GoogleGenAI {
 }
 
 function getModelFallbackChain(primaryModel?: string, isThinking?: boolean): string[] {
+  if (primaryModel === "gemini-3.1-flash-lite") {
+    return [primaryModel, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+  }
   if (isThinking || primaryModel === "gemini-2.5-pro") {
     return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
   }
@@ -323,11 +326,13 @@ app.get(["/api", "/api/index.ts"], (_req, res) => {
 });
 
 // 1. Health check endpoint (Rate limited: 120 req/min)
-app.get("/api/health", createRateLimiter(120, "health"), (_req, res) => {
+app.get(["/api/health", "/api/v1/health"], createRateLimiter(120, "health"), (_req, res) => {
+  const time = new Date().toISOString();
   res.json({
     status: "ok",
+    time,
     hasServerKey: !!process.env.GEMINI_API_KEY,
-    timestamp: new Date().toISOString(),
+    timestamp: time,
   });
 });
 
@@ -487,64 +492,92 @@ app.post("/api/v1/payment/verify", createRateLimiter(30, "payment-verify"), (req
 
 // 3. Main Blueprint & Firmware Stream Endpoint (Rate limited: 20 req/min per IP, max 3 concurrent)
 app.post("/api/v1/generate-stream", createRateLimiter(20, "stream-gen"), async (req, res) => {
-  const clientIp = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown_ip";
-  const ipKey = `stream-gen:${clientIp}`;
-  const ipRecord = rateLimitStore.get(ipKey);
+  try {
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      return res.status(400).json({
+        error: "Request body must be a JSON object.",
+        code: "INVALID_REQUEST_BODY",
+      });
+    }
 
-  // Check per-IP and global concurrency limits
-  if (ipRecord && ipRecord.activeConnections >= 3) {
-    return res.status(429).json({ error: "Maximum 3 concurrent generation streams per user. Please wait for the current stream to finish." });
-  }
+    const customKeyHeader = req.headers["x-gemini-api-key"];
+    const customKey =
+      (typeof customKeyHeader === "string" ? customKeyHeader : undefined) ||
+      (typeof req.body.custom_api_key === "string" ? req.body.custom_api_key : undefined);
+    if (!customKey?.trim() && !process.env.GEMINI_API_KEY?.trim()) {
+      return res.status(500).json({
+        error: "Server misconfigured: GEMINI_API_KEY missing",
+        code: "MISSING_GEMINI_API_KEY",
+      });
+    }
 
-  if (globalActiveStreams >= MAX_GLOBAL_CONCURRENT_STREAMS) {
-    return res.status(503).json({ error: "Server generation queue is full. Please try again in 15 seconds." });
-  }
+    const clientIp = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown_ip";
+    const ipKey = `stream-gen:${clientIp}`;
+    const ipRecord = rateLimitStore.get(ipKey);
 
-  const customKey = (req.headers["x-gemini-api-key"] as string) || req.body?.custom_api_key;
-  const userTier = (req.headers["x-user-tier"] as string) || req.body?.user_tier || "free";
-  const {
-    prompt,
-    preferred_board = "Auto-Select",
-    language = "Arduino C++ (.ino)",
-    complexity = "Undergraduate Lab / Mini Project",
-    thinking_mode = false,
-    enable_search = false,
-    model_override,
-  } = req.body;
+    // Check per-IP and global concurrency limits
+    if (ipRecord && ipRecord.activeConnections >= 3) {
+      return res.status(429).json({
+        error: "Maximum 3 concurrent generation streams per user. Please wait for the current stream to finish.",
+        code: "GENERATION_CONCURRENCY_LIMIT",
+      });
+    }
 
-  // Backend Entitlement Enforcement: Unlimited Prompt Length
-  const promptCheck = sanitizeAndValidatePrompt(prompt, 1000000);
-  if (!promptCheck.valid) {
-    return res.status(400).json({ error: promptCheck.error });
-  }
+    if (globalActiveStreams >= MAX_GLOBAL_CONCURRENT_STREAMS) {
+      return res.status(503).json({
+        error: "Server generation queue is full. Please try again in 15 seconds.",
+        code: "GENERATION_QUEUE_FULL",
+      });
+    }
 
-  // Normalize and sanitize metadata inputs
-  const safeBoard = String(preferred_board).substring(0, 64).replace(/[<>]/g, "");
-  const safeLang = String(language).substring(0, 64).replace(/[<>]/g, "");
-  const safeComplexity = String(complexity).substring(0, 64).replace(/[<>]/g, "");
+    const userTier = (req.headers["x-user-tier"] as string) || req.body?.user_tier || "free";
+    const {
+      prompt,
+      preferred_board = "Auto-Select",
+      language = "Arduino C++ (.ino)",
+      complexity = "Undergraduate Lab / Mini Project",
+      thinking_mode = false,
+      enable_search = false,
+      model_override,
+    } = req.body;
 
-  // Track active connection
-  if (ipRecord) ipRecord.activeConnections++;
-  globalActiveStreams++;
+    // Backend Entitlement Enforcement: Unlimited Prompt Length
+    const promptCheck = sanitizeAndValidatePrompt(prompt, 1000000);
+    if (!promptCheck.valid) {
+      return res.status(400).json({
+        error: promptCheck.error,
+        code: "INVALID_PROMPT",
+      });
+    }
 
-  let connectionCleanedUp = false;
-  const cleanupConnection = () => {
-    if (connectionCleanedUp) return;
-    connectionCleanedUp = true;
-    if (ipRecord) ipRecord.activeConnections = Math.max(0, ipRecord.activeConnections - 1);
-    globalActiveStreams = Math.max(0, globalActiveStreams - 1);
-  };
+    // Normalize and sanitize metadata inputs
+    const safeBoard = String(preferred_board).substring(0, 64).replace(/[<>]/g, "");
+    const safeLang = String(language).substring(0, 64).replace(/[<>]/g, "");
+    const safeComplexity = String(complexity).substring(0, 64).replace(/[<>]/g, "");
 
-  req.on("close", cleanupConnection);
-  req.on("end", cleanupConnection);
+    // Track active connection
+    if (ipRecord) ipRecord.activeConnections++;
+    globalActiveStreams++;
 
-  // SSE headers for streaming
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
+    let connectionCleanedUp = false;
+    const cleanupConnection = () => {
+      if (connectionCleanedUp) return;
+      connectionCleanedUp = true;
+      if (ipRecord) ipRecord.activeConnections = Math.max(0, ipRecord.activeConnections - 1);
+      globalActiveStreams = Math.max(0, globalActiveStreams - 1);
+    };
 
-  const userPromptText = `
+    req.on("close", cleanupConnection);
+    req.on("end", cleanupConnection);
+
+    // SSE headers for streaming
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const userPromptText = `
 ADVANCED EMBEDDED AGENT GENERATION REQUEST (AutoEmbed + LLM-Embedded + Arduino-LLM-Agent + Arduino-MCP + EmbedEval):
 - Raw Project Description: "${promptCheck.cleanPrompt}"
 - Preferred Microcontroller / Board: ${safeBoard}
@@ -557,89 +590,126 @@ STRICT ARCHITECTURAL & AGENTIC DIRECTIVES:
 3. **Task Decomposition & Pin Allocation (Arduino-LLM-Agent & Arduino-MCP)**: Enforce micro-controller constraints (avoiding ESP32 strapping/ADC2 conflicts, respecting Uno 5V / Pico 3.3V logic boundaries).
 4. **Multi-Role Safety & Evaluation (EmbedEval)**: Ensure proper power rails, common GND, flyback protection for inductive loads, and level shifting.
 5. **Output Format**: Ensure all 8 sections are fully detailed with pure GFM tables and 100% compilable firmware code.
-`;
+  `;
 
-  try {
-    const ai = getGenAIClient(customKey);
-    const candidateModels = getModelFallbackChain(model_override, thinking_mode);
+    try {
+      const ai = getGenAIClient(customKey);
+      const candidateModels = getModelFallbackChain(model_override, thinking_mode);
 
-    let streamSuccess = false;
-    let chunksEmitted = 0;
-    let lastError: any = null;
+      let streamSuccess = false;
+      let chunksEmitted = 0;
+      let lastError: any = null;
 
-    for (const modelName of candidateModels) {
-      if (streamSuccess) break;
+      for (const modelName of candidateModels) {
+        if (streamSuccess) break;
 
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const config: any = {
-            systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
-            temperature: 0.2,
-          };
-
-          if (thinking_mode && modelName === "gemini-2.5-pro") {
-            config.thinkingConfig = {
-              thinkingLevel: ThinkingLevel.HIGH,
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const config: any = {
+              systemInstruction: CIRCUITGEN_SYSTEM_INSTRUCTION,
+              temperature: 0.2,
             };
-          }
 
-          if (enable_search) {
-            config.tools = [{ googleSearch: {} }];
-          }
-
-          const stream = await ai.models.generateContentStream({
-            model: modelName,
-            contents: userPromptText,
-            config: config,
-          });
-
-          for await (const chunk of stream) {
-            const text = chunk.text;
-            if (text) {
-              res.write(`data: ${JSON.stringify({ text })}\n\n`);
-              chunksEmitted++;
+            if (thinking_mode && modelName === "gemini-2.5-pro") {
+              config.thinkingConfig = {
+                thinkingLevel: ThinkingLevel.HIGH,
+              };
             }
-          }
 
-          streamSuccess = true;
-          break;
-        } catch (err: any) {
-          lastError = err;
-          safeLog.warn(`Streaming attempt ${attempt + 1} failed on model ${modelName}:`, err?.message || err);
-          const parsed = parseGeminiError(err);
+            if (enable_search) {
+              config.tools = [{ googleSearch: {} }];
+            }
 
-          if (chunksEmitted > 0) {
+            const stream = await ai.models.generateContentStream({
+              model: modelName,
+              contents: userPromptText,
+              config: config,
+            });
+
+            for await (const chunk of stream) {
+              const text = chunk.text;
+              if (text) {
+                res.write(`data: ${JSON.stringify({ text })}\n\n`);
+                chunksEmitted++;
+              }
+            }
+
             streamSuccess = true;
             break;
-          }
+          } catch (err: any) {
+            lastError = err;
+            safeLog.warn(`Streaming attempt ${attempt + 1} failed on model ${modelName}:`, err?.message || err);
+            const parsed = parseGeminiError(err);
 
-          if (parsed.isOverloaded) {
-            await delay(400 * (attempt + 1));
-            continue;
+            if (chunksEmitted > 0) {
+              streamSuccess = true;
+              break;
+            }
+
+            if (parsed.isOverloaded) {
+              await delay(400 * (attempt + 1));
+              continue;
+            }
           }
         }
       }
-    }
 
-    if (streamSuccess) {
-      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-      res.end();
-    } else {
-      const parsed = parseGeminiError(lastError);
-      res.write(`data: ${JSON.stringify({ error: parsed.message })}\n\n`);
-      res.end();
+      if (streamSuccess) {
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+      } else {
+        const parsed = parseGeminiError(lastError);
+        res.write(
+          `data: ${JSON.stringify({
+            error: parsed.message,
+            code: "GENERATION_FAILED",
+          })}\n\n`
+        );
+        res.end();
+      }
+    } catch (error: any) {
+      safeLog.error("Stream generation outer error:", error);
+      const parsed = parseGeminiError(error);
+      if (res.headersSent) {
+        if (!res.writableEnded) {
+          res.write(
+            `data: ${JSON.stringify({
+              error: parsed.message,
+              code: "GENERATION_FAILED",
+            })}\n\n`
+          );
+          res.end();
+        }
+      } else {
+        res.status(parsed.statusCode).json({
+          error: parsed.message,
+          code: "GENERATION_FAILED",
+        });
+      }
+    } finally {
+      cleanupConnection();
     }
   } catch (error: any) {
-    safeLog.error("Stream generation outer error:", error);
+    safeLog.error("Generation request setup error:", error?.message || error);
     const parsed = parseGeminiError(error);
+    const statusCode =
+      parsed.statusCode >= 400 && parsed.statusCode < 600 ? parsed.statusCode : 500;
     if (res.headersSent) {
-      res.write(`data: ${JSON.stringify({ error: parsed.message })}\n\n`);
-      res.end();
-    } else {
-      res.status(parsed.statusCode).json({ error: parsed.message });
+      if (!res.writableEnded) {
+        res.write(
+          `data: ${JSON.stringify({
+            error: parsed.message || "Blueprint generation failed.",
+            code: "GENERATION_FAILED",
+          })}\n\n`
+        );
+        res.end();
+      }
+      return;
     }
-  } finally {
-    cleanupConnection();
+    return res.status(statusCode).json({
+      error: parsed.message || "Blueprint generation failed.",
+      code: "GENERATION_FAILED",
+    });
   }
 });
 
@@ -1027,9 +1097,21 @@ app.use("/api/*", (_req: Request, res: Response) => {
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   safeLog.error("Global Express Error Handler caught an exception:", err);
   if (!res.headersSent) {
-    const statusCode = err?.status || err?.statusCode || 500;
-    const message = err?.message || "Internal Server Error";
-    res.status(statusCode).json({ error: message });
+    const statusCode = Number(err?.status || err?.statusCode) || 500;
+    const isMalformedJson = err?.type === "entity.parse.failed";
+    const message = isMalformedJson
+      ? "Request body must be valid JSON."
+      : statusCode < 500 && typeof err?.message === "string"
+      ? err.message
+      : "Internal server error.";
+    const code = isMalformedJson
+      ? "INVALID_JSON"
+      : statusCode === 413
+      ? "PAYLOAD_TOO_LARGE"
+      : statusCode < 500
+      ? "REQUEST_FAILED"
+      : "INTERNAL_SERVER_ERROR";
+    res.status(statusCode).json({ error: message, code });
   }
 });
 
@@ -1080,4 +1162,3 @@ export default app;
 if (!process.env.VERCEL) {
   startServer();
 }
-

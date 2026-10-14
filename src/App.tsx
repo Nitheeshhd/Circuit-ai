@@ -285,8 +285,19 @@ export default function App() {
 
   // Initial check for server key
   useEffect(() => {
-    fetch("/api/health")
-      .then((res) => res.json())
+    fetch("/api/v1/health")
+      .then(async (res) => {
+        let data: { hasServerKey?: boolean; error?: string };
+        try {
+          data = await res.json();
+        } catch {
+          throw new Error(`Health check returned a non-JSON response (HTTP ${res.status}).`);
+        }
+        if (!res.ok) {
+          throw new Error(data.error || `Health check failed with status ${res.status}.`);
+        }
+        return data;
+      })
       .then((data) => {
         if (data && typeof data.hasServerKey === "boolean") {
           setHasServerKey(data.hasServerKey);
@@ -405,7 +416,7 @@ export default function App() {
   };
 
   // Generate Stream
-  const handleGenerate = async () => {
+  const handleGenerate = async (requestedModel?: string) => {
     if (!prompt.trim()) return;
 
     // Verify monthly generation quota (9 free projects per month per account)
@@ -433,12 +444,12 @@ export default function App() {
     abortControllerRef.current = new AbortController();
 
     try {
-      let modelOverride: string | undefined = undefined;
-      if (lowLatencyMode) {
+      let modelOverride: string | undefined = requestedModel;
+      if (!modelOverride && lowLatencyMode) {
         modelOverride = "gemini-3.1-flash-lite";
-      } else if (thinkingMode) {
+      } else if (!modelOverride && thinkingMode) {
         modelOverride = "gemini-3.1-pro-preview";
-      } else if (searchGrounding) {
+      } else if (!modelOverride && searchGrounding) {
         modelOverride = "gemini-3.5-flash";
       }
 
@@ -461,8 +472,16 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `Server responded with status ${res.status}`);
+        let errorMessage = `Server responded with status ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (typeof errJson.error === "string") {
+            errorMessage = errJson.error;
+          }
+        } catch {
+          errorMessage = `Server returned a non-JSON error response (HTTP ${res.status}).`;
+        }
+        throw new Error(errorMessage);
       }
 
       const reader = res.body?.getReader();
@@ -730,7 +749,7 @@ export default function App() {
                           setThinkingMode(false);
                           setModelMode("lite");
                           setErrorMsg(null);
-                          setTimeout(() => handleGenerate(), 100);
+                          void handleGenerate("gemini-3.1-flash-lite");
                         }}
                         className="px-3 py-1 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 rounded-lg text-xs font-bold border border-indigo-500/30 transition cursor-pointer"
                       >
